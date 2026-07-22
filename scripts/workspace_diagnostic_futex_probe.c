@@ -304,7 +304,15 @@ static void process_stop(pid_t tid, int status, int socket_fd, struct control_st
 static void install_futex_trace_filter(void) {
     const struct sock_filter filter[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_futex, 0, 1),
+        /* Skip the futex-operation filter unless this is SYS_futex. */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_futex, 0, 8),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[1])),
+        BPF_STMT(BPF_ALU | BPF_AND | BPF_K, FUTEX_CMD_MASK),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FUTEX_WAIT, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FUTEX_WAIT_BITSET, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FUTEX_WAIT_REQUEUE_PI, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
