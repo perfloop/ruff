@@ -4,7 +4,8 @@
 //! It deliberately uses a multi-file, diagnostic-rich workspace so that every
 //! worker has to construct a full document diagnostic report. The measured
 //! interval starts when it sends `workspace/diagnostic` and ends when the
-//! complete LSP response is received.
+//! complete LSP response is received. Each proof sample warms one instance,
+//! then reports the arithmetic mean of four fresh request/response spans.
 
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -30,8 +31,9 @@ use ruff_db::system::{OsSystem, SystemPathBuf};
 use serde_json::Value;
 use ty_server::{ClientOptions, DiagnosticMode, Server};
 
-const FILES: usize = 96;
-const DIAGNOSTICS_PER_FILE: usize = 96;
+const FILES: usize = 64;
+const DIAGNOSTICS_PER_FILE: usize = 64;
+const MEASURED_REQUESTS: u32 = 4;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
@@ -63,12 +65,12 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(workload: Workload) -> Result<Self> {
+    fn new(workload: Workload, run_index: u32) -> Result<Self> {
         let root = std::env::current_dir()
             .context("failed to determine the repository root")?
             .join(".perfloop-workspace-diagnostic")
             .join(format!(
-                "{}-{}",
+                "{}-{}-{run_index}",
                 std::process::id(),
                 workload.expected_diagnostics_per_file()
             ));
@@ -88,7 +90,9 @@ impl Fixture {
         for file_index in 0..FILES {
             let mut source = String::with_capacity(DIAGNOSTICS_PER_FILE * 36);
             for diagnostic_index in 0..DIAGNOSTICS_PER_FILE {
-                let value = file_index * DIAGNOSTICS_PER_FILE + diagnostic_index;
+                let value = run_index as usize * FILES * DIAGNOSTICS_PER_FILE
+                    + file_index * DIAGNOSTICS_PER_FILE
+                    + diagnostic_index;
                 if matches!(workload, Workload::Rich) || diagnostic_index == 0 {
                     writeln!(source, "value_{value}: str = {value}")?;
                 } else {
@@ -353,17 +357,19 @@ fn marker(stage: &str) -> Result<()> {
     }
 }
 
-fn run(workload: Workload) -> Result<Measurement> {
-    marker("starting")?;
-    let fixture = Fixture::new(workload)?;
+fn run_once(workload: Workload, run_index: u32, trace_request: bool) -> Result<Measurement> {
+    let fixture = Fixture::new(workload, run_index)?;
     let (mut client, server_thread) = ServerClient::start(&fixture.root)?;
-    marker("ready")?;
 
-    marker("active")?;
+    if trace_request {
+        marker("active")?;
+    }
     let start = Instant::now();
     let report = client.workspace_diagnostic()?;
     let elapsed = start.elapsed();
-    marker("complete")?;
+    if trace_request {
+        marker("complete")?;
+    }
 
     let mut reports = 0usize;
     let mut diagnostic_items = 0usize;
@@ -396,6 +402,26 @@ fn run(workload: Workload) -> Result<Measurement> {
 
     Ok(Measurement {
         elapsed,
+        reports,
+        diagnostic_items,
+    })
+}
+
+fn run(workload: Workload) -> Result<Measurement> {
+    let _ = run_once(workload, 0, false)?;
+
+    let mut elapsed = Duration::ZERO;
+    let mut reports = 0usize;
+    let mut diagnostic_items = 0usize;
+    for run_index in 1..=MEASURED_REQUESTS {
+        let measurement = run_once(workload, run_index, run_index == 1)?;
+        elapsed += measurement.elapsed;
+        reports = measurement.reports;
+        diagnostic_items = measurement.diagnostic_items;
+    }
+
+    Ok(Measurement {
+        elapsed: elapsed / MEASURED_REQUESTS,
         reports,
         diagnostic_items,
     })
