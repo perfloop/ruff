@@ -128,7 +128,9 @@ impl ServerClient {
 
         let server_thread = std::thread::spawn(move || -> Result<()> {
             let system = Arc::new(OsSystem::new(&server_root));
-            let server = Server::new(worker_threads, server_connection, system, false)
+            // Test mode suppresses only process-global logging initialization, allowing the
+            // fixed set of fresh server instances used for one benchmark sample.
+            let server = Server::new(worker_threads, server_connection, system, true)
                 .map_err(|error| anyhow!("failed to start LSP server: {error}"))?;
             server
                 .run()
