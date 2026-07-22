@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+#[cfg(feature = "perfloop-probe")]
+use std::sync::TryLockError;
 use std::time::{Duration, Instant};
 
 use lsp_server::RequestId;
@@ -35,6 +37,56 @@ use crate::session::client::Client;
 use crate::session::index::Index;
 use crate::session::{GlobalSettings, SessionSnapshot, SuspendedWorkspaceDiagnosticRequest};
 use crate::system::file_to_uri;
+
+/// Temporary lock timing for the case-local workspace-diagnostic benchmark.
+///
+/// This module is compiled only by the benchmark's `perfloop-probe` feature and
+/// is deliberately kept separate from the production code path.
+#[cfg(feature = "perfloop-probe")]
+pub mod perfloop_probe {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct LockStats {
+        pub acquisitions: u64,
+        pub contended_acquisitions: u64,
+        pub total_wait_ns: u64,
+        pub total_hold_ns: u64,
+    }
+
+    static ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
+    static CONTENDED_ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_HOLD_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        ACQUISITIONS.store(0, Ordering::SeqCst);
+        CONTENDED_ACQUISITIONS.store(0, Ordering::SeqCst);
+        TOTAL_WAIT_NS.store(0, Ordering::SeqCst);
+        TOTAL_HOLD_NS.store(0, Ordering::SeqCst);
+    }
+
+    pub fn snapshot() -> LockStats {
+        LockStats {
+            acquisitions: ACQUISITIONS.load(Ordering::SeqCst),
+            contended_acquisitions: CONTENDED_ACQUISITIONS.load(Ordering::SeqCst),
+            total_wait_ns: TOTAL_WAIT_NS.load(Ordering::SeqCst),
+            total_hold_ns: TOTAL_HOLD_NS.load(Ordering::SeqCst),
+        }
+    }
+
+    pub(crate) fn record_lock(wait: Duration, hold: Duration, contended: bool) {
+        let to_ns = |duration: Duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+
+        ACQUISITIONS.fetch_add(1, Ordering::SeqCst);
+        if contended {
+            CONTENDED_ACQUISITIONS.fetch_add(1, Ordering::SeqCst);
+        }
+        TOTAL_WAIT_NS.fetch_add(to_ns(wait), Ordering::SeqCst);
+        TOTAL_HOLD_NS.fetch_add(to_ns(hold), Ordering::SeqCst);
+    }
+}
 
 /// Handler for [Workspace diagnostics](workspace-diagnostics)
 ///
@@ -245,9 +297,28 @@ impl ProgressReporter for WorkspaceDiagnosticsProgressReporter<'_> {
         // Another thread might have panicked at this point because of a salsa cancellation which
         // poisoned the result. If the response is poisoned, just don't report and wait for our thread
         // to unwind with a salsa cancellation next.
+        #[cfg(feature = "perfloop-probe")]
+        let lock_started = Instant::now();
+        #[cfg(feature = "perfloop-probe")]
+        let mut contended = false;
+        #[cfg(feature = "perfloop-probe")]
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => {
+                contended = true;
+                let Ok(state) = self.state.lock() else {
+                    return;
+                };
+                state
+            }
+            Err(TryLockError::Poisoned(_)) => return,
+        };
+        #[cfg(not(feature = "perfloop-probe"))]
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        #[cfg(feature = "perfloop-probe")]
+        let lock_acquired = Instant::now();
 
         state.checked_files += 1;
 
@@ -269,6 +340,13 @@ impl ProgressReporter for WorkspaceDiagnosticsProgressReporter<'_> {
         }
 
         state.response.maybe_flush();
+
+        #[cfg(feature = "perfloop-probe")]
+        {
+            let hold = lock_acquired.elapsed();
+            drop(state);
+            perfloop_probe::record_lock(lock_started.elapsed(), hold, contended);
+        }
     }
 
     fn report_diagnostics(&mut self, db: &ProjectDatabase, diagnostics: Vec<Diagnostic>) {

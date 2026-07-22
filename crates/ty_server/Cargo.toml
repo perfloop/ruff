@@ -13,6 +13,10 @@ license = { workspace = true }
 [lib]
 doctest = false
 
+[features]
+# Enables temporary lock timing used by the case-local workspace-diagnostic benchmark.
+perfloop-probe = []
+
 [dependencies]
 ruff_db = { workspace = true, features = ["os"] }
 ruff_diagnostics = { workspace = true }
