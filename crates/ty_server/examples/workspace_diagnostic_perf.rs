@@ -34,8 +34,6 @@ const SAMPLE_SHAPE: WorkloadShape = WorkloadShape {
     files: 64,
     diagnostics_per_file: 64,
 };
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[derive(Clone, Copy)]
 enum Workload {
     Rich,
@@ -316,8 +314,8 @@ impl ServerClient {
     fn receive(&self) -> Result<Message> {
         self.connection
             .receiver
-            .recv_timeout(RESPONSE_TIMEOUT)
-            .map_err(|error| anyhow!("timed out waiting for an LSP message: {error}"))
+            .recv()
+            .map_err(|error| anyhow!("failed to receive an LSP message: {error}"))
     }
 
     fn handle_server_request(&self, request: ServerRequest) -> Result<()> {
