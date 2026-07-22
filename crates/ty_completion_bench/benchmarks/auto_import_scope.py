@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -73,20 +74,10 @@ def run_scenario(name: str, minimum_candidates: int, iterations: int) -> tuple[f
     scenario_root = FIXTURE_ROOT / name
     main = (scenario_root / "main.py").resolve()
     offset = (scenario_root / "cursor-offset").read_text(encoding="utf-8").strip()
-    command = [
-        "cargo",
-        "run",
-        "--quiet",
-        "--profile",
-        "profiling",
-        "--package",
-        "ty_completion_bench",
-        "--",
-        str(main),
-        offset,
-        "--iters",
-        str(iterations),
-    ]
+    benchmark_binary = os.environ.get("PERFLOOP_BENCH_BIN")
+    if benchmark_binary is None:
+        raise RuntimeError("PERFLOOP_BENCH_BIN was not set by the benchmark build")
+    command = [benchmark_binary, str(main), offset, "--iters", str(iterations)]
     completed = subprocess.run(
         command,
         cwd=WORKSPACE_ROOT,
