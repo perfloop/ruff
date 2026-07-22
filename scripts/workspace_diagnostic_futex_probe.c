@@ -4,8 +4,8 @@
  * The standalone driver synchronizes the measured interval with this helper by
  * sending an active/complete datagram and waiting for the corresponding ack.
  * The child installs a seccomp filter that produces ptrace events only for
- * futex syscalls. A counted blocked wait is therefore a completed futex wait
- * from the exact acknowledged request interval, not a polling observation.
+ * futex syscalls. A counted wait attempt is therefore a kernel futex-wait
+ * entry from the exact acknowledged request interval, not a polling observation.
  */
 
 #define _GNU_SOURCE
@@ -42,21 +42,16 @@
 struct tracee {
     pid_t tid;
     bool active;
-    bool pending_futex_wait;
-    unsigned long long pending_address;
 };
 
 struct address_stat {
     unsigned long long address;
-    unsigned long long calls;
-    unsigned long long blocked;
+    unsigned long long attempts;
 };
 
 struct statistics {
-    unsigned long long futex_wait_calls;
-    unsigned long long futex_blocked_waits;
-    unsigned long long max_address_calls;
-    unsigned long long max_address_blocked_waits;
+    unsigned long long futex_wait_attempts;
+    unsigned long long max_address_attempts;
     struct address_stat addresses[MAX_ADDRESSES];
     size_t address_count;
 };
@@ -126,12 +121,6 @@ static void resume_continue(pid_t tid, int signal_to_deliver) {
     }
 }
 
-static void resume_until_syscall_exit(pid_t tid) {
-    if (ptrace(PTRACE_SYSCALL, tid, 0, 0) == -1 && errno != ESRCH) {
-        fail("failed to resume traced futex wait");
-    }
-}
-
 static struct address_stat *address_stat_for(struct statistics *statistics,
                                               unsigned long long address) {
     for (size_t index = 0; index < statistics->address_count; index++) {
@@ -152,21 +141,12 @@ static struct address_stat *address_stat_for(struct statistics *statistics,
     return statistic;
 }
 
-static void record_wait_call(struct statistics *statistics, unsigned long long address) {
-    statistics->futex_wait_calls++;
+static void record_wait_attempt(struct statistics *statistics, unsigned long long address) {
+    statistics->futex_wait_attempts++;
     struct address_stat *address_statistic = address_stat_for(statistics, address);
-    address_statistic->calls++;
-    if (address_statistic->calls > statistics->max_address_calls) {
-        statistics->max_address_calls = address_statistic->calls;
-    }
-}
-
-static void record_blocked_wait(struct statistics *statistics, unsigned long long address) {
-    statistics->futex_blocked_waits++;
-    struct address_stat *address_statistic = address_stat_for(statistics, address);
-    address_statistic->blocked++;
-    if (address_statistic->blocked > statistics->max_address_blocked_waits) {
-        statistics->max_address_blocked_waits = address_statistic->blocked;
+    address_statistic->attempts++;
+    if (address_statistic->attempts > statistics->max_address_attempts) {
+        statistics->max_address_attempts = address_statistic->attempts;
     }
 }
 
@@ -276,30 +256,8 @@ static void observe_seccomp_stop(struct tracee *tracee, const struct control_sta
 
     unsigned long long address = 0;
     if (control->interval_active && futex_wait_address(&registers, &address)) {
-        tracee->pending_futex_wait = true;
-        tracee->pending_address = address;
-        record_wait_call(statistics, address);
-        resume_until_syscall_exit(tracee->tid);
-    } else {
-        resume_continue(tracee->tid, 0);
+        record_wait_attempt(statistics, address);
     }
-}
-
-static void observe_futex_exit(struct tracee *tracee, struct statistics *statistics) {
-    struct user_regs_struct registers;
-    if (ptrace(PTRACE_GETREGS, tracee->tid, 0, &registers) == -1) {
-        if (errno == ESRCH) {
-            remove_tracee(tracee->tid);
-            return;
-        }
-        fail("failed to read futex return register");
-    }
-
-    /* -EAGAIN means the value changed before the kernel could sleep. */
-    if ((long)registers.rax != -EAGAIN) {
-        record_blocked_wait(statistics, tracee->pending_address);
-    }
-    tracee->pending_futex_wait = false;
     resume_continue(tracee->tid, 0);
 }
 
@@ -333,11 +291,6 @@ static void process_stop(pid_t tid, int status, int socket_fd, struct control_st
 
     if (signal_number == SIGTRAP && event == PTRACE_EVENT_SECCOMP) {
         observe_seccomp_stop(tracee, control, statistics);
-        return;
-    }
-
-    if (signal_number == (SIGTRAP | 0x80) && tracee->pending_futex_wait) {
-        observe_futex_exit(tracee, statistics);
         return;
     }
 
@@ -392,8 +345,7 @@ static pid_t start_child(char *const child_argv[]) {
 
     close(start_pipe[0]);
     if (ptrace(PTRACE_SEIZE, child, 0,
-               PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | PTRACE_O_TRACESECCOMP |
-                   PTRACE_O_EXITKILL) == -1) {
+               PTRACE_O_TRACECLONE | PTRACE_O_TRACESECCOMP | PTRACE_O_EXITKILL) == -1) {
         fail("failed to seize workload child");
     }
     if (ptrace(PTRACE_INTERRUPT, child, 0, 0) == -1) {
@@ -469,10 +421,8 @@ int main(int argc, char *argv[]) {
         fail("workload did not complete the measured control interval");
     }
 
-    printf("futex_wait_calls=%llu\n", statistics.futex_wait_calls);
-    printf("futex_blocked_waits=%llu\n", statistics.futex_blocked_waits);
+    printf("futex_wait_attempts=%llu\n", statistics.futex_wait_attempts);
     printf("futex_wait_addresses=%zu\n", statistics.address_count);
-    printf("futex_wait_max_address_calls=%llu\n", statistics.max_address_calls);
-    printf("futex_wait_max_address_blocked_waits=%llu\n", statistics.max_address_blocked_waits);
+    printf("futex_wait_max_address_attempts=%llu\n", statistics.max_address_attempts);
     return EXIT_SUCCESS;
 }
