@@ -35,6 +35,7 @@ const FILES: usize = 64;
 const DIAGNOSTICS_PER_FILE: usize = 64;
 const MEASURED_REQUESTS: u32 = 4;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const PROBE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy)]
 enum Workload {
@@ -321,9 +322,14 @@ impl ServerClient {
     }
 
     fn receive(&self) -> Result<Message> {
+        let timeout = if std::env::var_os("PERFLOOP_PROBE_CONTROL_SOCKET").is_some() {
+            PROBE_RESPONSE_TIMEOUT
+        } else {
+            RESPONSE_TIMEOUT
+        };
         self.connection
             .receiver
-            .recv_timeout(RESPONSE_TIMEOUT)
+            .recv_timeout(timeout)
             .map_err(|error| anyhow!("timed out waiting for an LSP message: {error}"))
     }
 
