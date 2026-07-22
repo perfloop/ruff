@@ -43,6 +43,7 @@ mod rename;
 mod semantic_tokens;
 mod signature_help;
 mod type_hierarchy;
+#[cfg(feature = "perfloop-probe")]
 mod workspace_diagnostic_benchmark;
 mod workspace_folders;
 
