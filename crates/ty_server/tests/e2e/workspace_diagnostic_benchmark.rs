@@ -1,7 +1,17 @@
-include!("e2e/main.rs");
+//! Case-local benchmark for diagnostic-rich `workspace/diagnostic` requests.
+//!
+//! The test reuses the repository's in-memory LSP fixture so the timed region
+//! begins at request submission and ends only when the complete response has
+//! been received and validated.
 
 use std::fmt::Write as _;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use lsp_types::WorkspaceDocumentDiagnosticReport;
+use ruff_db::system::SystemPath;
+use ty_server::{ClientOptions, DiagnosticMode};
+
+use crate::TestServerBuilder;
 
 const FILE_COUNT: usize = 48;
 const ERRORS_PER_FILE: usize = 64;
@@ -28,7 +38,7 @@ fn workspace_diagnostic_contention_benchmark() -> anyhow::Result<()> {
     let mut builder = TestServerBuilder::new()?
         .with_workspace(workspace_root, None)?
         .with_initialization_options(
-            ClientOptions::default().with_diagnostic_mode(ty_server::DiagnosticMode::Workspace),
+            ClientOptions::default().with_diagnostic_mode(DiagnosticMode::Workspace),
         )
         .with_full_diagnostic_output()
         .enable_diagnostic_related_information(true);
@@ -54,9 +64,7 @@ fn workspace_diagnostic_contention_benchmark() -> anyhow::Result<()> {
     let mut reported_diagnostics = 0;
     let mut diagnostics_with_rendered_data = 0;
     for item in report.items {
-        let lsp_types::WorkspaceDocumentDiagnosticReport::WorkspaceFullDocumentDiagnosticReport(
-            report,
-        ) = item
+        let WorkspaceDocumentDiagnosticReport::WorkspaceFullDocumentDiagnosticReport(report) = item
         else {
             panic!("a request without prior IDs must return full reports");
         };
