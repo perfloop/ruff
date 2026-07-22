@@ -30,8 +30,8 @@ use ruff_db::system::{OsSystem, SystemPathBuf};
 use serde_json::Value;
 use ty_server::{ClientOptions, DiagnosticMode, Server};
 
-const FILES: usize = 64;
-const DIAGNOSTICS_PER_FILE: usize = 64;
+const FILES: usize = 96;
+const DIAGNOSTICS_PER_FILE: usize = 96;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
