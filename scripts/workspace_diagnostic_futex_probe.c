@@ -1,11 +1,11 @@
 /*
- * Sample futex waiters in a child workspace-diagnostic workload.
+ * Trace completed futex waits in a child workspace-diagnostic workload.
  *
- * This probe intentionally lives outside the Rust server implementation. It
- * traces a child process with ptrace, sampling register state only while the
- * standalone driver says its workspace/diagnostic request is active. That
- * avoids target-source timing instrumentation while still exposing whether
- * multiple worker threads are blocked in the same futex wait.
+ * The standalone driver sends two datagrams over a control socket: one directly
+ * before it submits workspace/diagnostic and one after it receives the complete
+ * response. Between those ordered protocol events this helper follows every
+ * futex syscall entry and exit with PTRACE_SYSCALL. Unlike a polling sample, a
+ * counted wait is a syscall the traced process actually completed.
  */
 
 #define _GNU_SOURCE
@@ -19,8 +19,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -32,33 +34,33 @@
 #define MAX_THREADS 256
 #define MAX_ADDRESSES 1024
 
-enum marker_state {
-    MARKER_WAITING,
-    MARKER_ACTIVE,
-    MARKER_COMPLETE,
-};
-
 struct tracee {
     pid_t tid;
     bool active;
+    bool in_syscall;
+    bool pending_futex_wait;
+    unsigned long long pending_address;
 };
 
 struct address_stat {
     unsigned long long address;
-    unsigned long long samples;
+    unsigned long long calls;
+    unsigned long long blocked;
 };
 
 struct statistics {
-    unsigned long long wait_samples;
-    unsigned long long max_address_samples;
-    unsigned int max_same_address_waiters;
+    unsigned long long futex_wait_calls;
+    unsigned long long futex_blocked_waits;
+    unsigned long long max_address_calls;
+    unsigned long long max_address_blocked_waits;
     struct address_stat addresses[MAX_ADDRESSES];
     size_t address_count;
 };
 
-struct sampled_address {
-    unsigned long long address;
-    unsigned int waiters;
+struct control_state {
+    bool interval_active;
+    bool interval_started;
+    bool interval_complete;
 };
 
 static struct tracee tracees[MAX_THREADS];
@@ -84,8 +86,10 @@ static void add_tracee(pid_t tid) {
 
     for (size_t index = 0; index < MAX_THREADS; index++) {
         if (!tracees[index].active) {
-            tracees[index].active = true;
-            tracees[index].tid = tid;
+            tracees[index] = (struct tracee){
+                .tid = tid,
+                .active = true,
+            };
             return;
         }
     }
@@ -112,19 +116,16 @@ static size_t active_tracees(void) {
 }
 
 static void resume_tracee(pid_t tid, int signal_to_deliver) {
-    if (ptrace(PTRACE_CONT, tid, 0, signal_to_deliver) == -1 && errno != ESRCH) {
+    if (ptrace(PTRACE_SYSCALL, tid, 0, signal_to_deliver) == -1 && errno != ESRCH) {
         fail("failed to resume traced thread");
     }
 }
 
-static void record_address(struct statistics *statistics, unsigned long long address) {
+static struct address_stat *address_stat_for(struct statistics *statistics,
+                                              unsigned long long address) {
     for (size_t index = 0; index < statistics->address_count; index++) {
         if (statistics->addresses[index].address == address) {
-            statistics->addresses[index].samples++;
-            if (statistics->addresses[index].samples > statistics->max_address_samples) {
-                statistics->max_address_samples = statistics->addresses[index].samples;
-            }
-            return;
+            return &statistics->addresses[index];
         }
     }
 
@@ -133,41 +134,148 @@ static void record_address(struct statistics *statistics, unsigned long long add
         exit(EXIT_FAILURE);
     }
 
-    statistics->addresses[statistics->address_count].address = address;
-    statistics->addresses[statistics->address_count].samples = 1;
-    statistics->address_count++;
-    if (statistics->max_address_samples == 0) {
-        statistics->max_address_samples = 1;
+    struct address_stat *statistic = &statistics->addresses[statistics->address_count++];
+    *statistic = (struct address_stat){
+        .address = address,
+    };
+    return statistic;
+}
+
+static void record_wait_call(struct statistics *statistics, unsigned long long address) {
+    statistics->futex_wait_calls++;
+    struct address_stat *address_statistic = address_stat_for(statistics, address);
+    address_statistic->calls++;
+    if (address_statistic->calls > statistics->max_address_calls) {
+        statistics->max_address_calls = address_statistic->calls;
     }
 }
 
-static enum marker_state marker_state(const char *path) {
-    FILE *marker = fopen(path, "r");
-    if (marker == NULL) {
-        return MARKER_WAITING;
+static void record_blocked_wait(struct statistics *statistics, unsigned long long address) {
+    statistics->futex_blocked_waits++;
+    struct address_stat *address_statistic = address_stat_for(statistics, address);
+    address_statistic->blocked++;
+    if (address_statistic->blocked > statistics->max_address_blocked_waits) {
+        statistics->max_address_blocked_waits = address_statistic->blocked;
     }
-
-    char value[32] = {0};
-    const bool read_value = fgets(value, sizeof(value), marker) != NULL;
-    fclose(marker);
-    if (!read_value) {
-        return MARKER_WAITING;
-    }
-    if (strncmp(value, "active", strlen("active")) == 0) {
-        return MARKER_ACTIVE;
-    }
-    if (strncmp(value, "complete", strlen("complete")) == 0) {
-        return MARKER_COMPLETE;
-    }
-    return MARKER_WAITING;
 }
 
-static void process_stop(pid_t tid, int status) {
+static int create_control_socket(const char *path) {
+    if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        errno = ENAMETOOLONG;
+        fail("control socket path is too long");
+    }
+
+    const int socket_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (socket_fd == -1) {
+        fail("failed to create control socket");
+    }
+
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, strlen(path) + 1);
+    if (unlink(path) == -1 && errno != ENOENT) {
+        fail("failed to remove stale control socket");
+    }
+    if (bind(socket_fd, (const struct sockaddr *)&address, sizeof(address)) == -1) {
+        fail("failed to bind control socket");
+    }
+    return socket_fd;
+}
+
+static void drain_control(int socket_fd, struct control_state *control) {
+    for (;;) {
+        unsigned char message[32];
+        const ssize_t received = recv(socket_fd, message, sizeof(message), MSG_DONTWAIT);
+        if (received == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+            fail("failed to receive control marker");
+        }
+
+        for (ssize_t index = 0; index < received; index++) {
+            switch (message[index]) {
+            case 'A':
+                if (control->interval_started || control->interval_complete) {
+                    errno = EPROTO;
+                    fail("received an invalid active marker");
+                }
+                control->interval_started = true;
+                control->interval_active = true;
+                break;
+            case 'C':
+                if (!control->interval_started || control->interval_complete) {
+                    errno = EPROTO;
+                    fail("received an invalid complete marker");
+                }
+                control->interval_active = false;
+                control->interval_complete = true;
+                break;
+            default:
+                errno = EPROTO;
+                fail("received an unknown control marker");
+            }
+        }
+    }
+}
+
+static bool futex_wait_address(const struct user_regs_struct *registers,
+                               unsigned long long *address) {
+    const unsigned int operation = (unsigned int)registers->rsi & FUTEX_CMD_MASK;
+    const bool is_wait = registers->orig_rax == SYS_futex &&
+                         (operation == FUTEX_WAIT || operation == FUTEX_WAIT_BITSET ||
+                          operation == FUTEX_WAIT_REQUEUE_PI);
+    if (is_wait) {
+        *address = (unsigned long long)registers->rdi;
+    }
+    return is_wait;
+}
+
+static void observe_syscall_stop(struct tracee *tracee, const struct control_state *control,
+                                 struct statistics *statistics) {
+    struct user_regs_struct registers;
+    if (ptrace(PTRACE_GETREGS, tracee->tid, 0, &registers) == -1) {
+        if (errno == ESRCH) {
+            remove_tracee(tracee->tid);
+            return;
+        }
+        fail("failed to read traced thread registers");
+    }
+
+    if (!tracee->in_syscall) {
+        tracee->in_syscall = true;
+        unsigned long long address = 0;
+        if (control->interval_active && futex_wait_address(&registers, &address)) {
+            tracee->pending_futex_wait = true;
+            tracee->pending_address = address;
+            record_wait_call(statistics, address);
+        }
+        return;
+    }
+
+    tracee->in_syscall = false;
+    if (tracee->pending_futex_wait) {
+        /* -EAGAIN means the value changed before the kernel could sleep. */
+        if ((long)registers.rax != -EAGAIN) {
+            record_blocked_wait(statistics, tracee->pending_address);
+        }
+        tracee->pending_futex_wait = false;
+    }
+}
+
+static void process_stop(pid_t tid, int status, int socket_fd, struct control_state *control,
+                         struct statistics *statistics) {
     if (WIFEXITED(status) || WIFSIGNALED(status)) {
         remove_tracee(tid);
         return;
     }
     if (!WIFSTOPPED(status)) {
+        return;
+    }
+
+    drain_control(socket_fd, control);
+    struct tracee *tracee = find_tracee(tid);
+    if (tracee == NULL) {
         return;
     }
 
@@ -179,127 +287,24 @@ static void process_stop(pid_t tid, int status) {
             fail("failed to read cloned thread id");
         }
         add_tracee((pid_t)child_tid);
+        tracee->in_syscall = false;
         resume_tracee(tid, 0);
         return;
     }
 
+    if (signal_number == (SIGTRAP | 0x80)) {
+        observe_syscall_stop(tracee, control, statistics);
+        if (tracee->active) {
+            resume_tracee(tid, 0);
+        }
+        return;
+    }
+
+    tracee->in_syscall = false;
     if (signal_number == SIGTRAP || signal_number == SIGSTOP) {
         resume_tracee(tid, 0);
     } else {
         resume_tracee(tid, signal_number);
-    }
-}
-
-static void drain_events(void) {
-    for (;;) {
-        int status = 0;
-        const pid_t tid = waitpid(-1, &status, __WALL | WNOHANG);
-        if (tid == 0) {
-            return;
-        }
-        if (tid == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == ECHILD) {
-                return;
-            }
-            fail("failed while draining ptrace events");
-        }
-        process_stop(tid, status);
-    }
-}
-
-static bool futex_wait_address(pid_t tid, unsigned long long *address) {
-    if (ptrace(PTRACE_INTERRUPT, tid, 0, 0) == -1) {
-        if (errno == ESRCH) {
-            remove_tracee(tid);
-            return false;
-        }
-        fail("failed to interrupt traced thread");
-    }
-
-    int status = 0;
-    for (;;) {
-        const pid_t waited = waitpid(tid, &status, __WALL);
-        if (waited == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == ECHILD || errno == ESRCH) {
-                remove_tracee(tid);
-                return false;
-            }
-            fail("failed to wait for interrupted thread");
-        }
-        break;
-    }
-
-    if (WIFEXITED(status) || WIFSIGNALED(status)) {
-        remove_tracee(tid);
-        return false;
-    }
-    if (!WIFSTOPPED(status)) {
-        return false;
-    }
-
-    const int signal_number = WSTOPSIG(status);
-    const unsigned int event = (unsigned int)status >> 16;
-    if (signal_number != SIGTRAP || event != PTRACE_EVENT_STOP) {
-        process_stop(tid, status);
-        return false;
-    }
-
-    struct user_regs_struct registers;
-    if (ptrace(PTRACE_GETREGS, tid, 0, &registers) == -1) {
-        if (errno == ESRCH) {
-            remove_tracee(tid);
-            return false;
-        }
-        fail("failed to read traced thread registers");
-    }
-
-    const unsigned int operation = (unsigned int)registers.rsi & FUTEX_CMD_MASK;
-    const bool is_wait = registers.orig_rax == SYS_futex &&
-                         (operation == FUTEX_WAIT || operation == FUTEX_WAIT_BITSET ||
-                          operation == FUTEX_WAIT_REQUEUE_PI);
-    if (is_wait) {
-        *address = (unsigned long long)registers.rdi;
-    }
-    resume_tracee(tid, 0);
-    return is_wait;
-}
-
-static void sample_waiters(struct statistics *statistics) {
-    struct sampled_address addresses[MAX_THREADS] = {0};
-    size_t address_count = 0;
-
-    for (size_t index = 0; index < MAX_THREADS; index++) {
-        if (!tracees[index].active) {
-            continue;
-        }
-
-        unsigned long long address = 0;
-        if (!futex_wait_address(tracees[index].tid, &address)) {
-            continue;
-        }
-
-        statistics->wait_samples++;
-        record_address(statistics, address);
-
-        size_t address_index = 0;
-        while (address_index < address_count && addresses[address_index].address != address) {
-            address_index++;
-        }
-        if (address_index == address_count) {
-            addresses[address_count].address = address;
-            addresses[address_count].waiters = 0;
-            address_count++;
-        }
-        addresses[address_index].waiters++;
-        if (addresses[address_index].waiters > statistics->max_same_address_waiters) {
-            statistics->max_same_address_waiters = addresses[address_index].waiters;
-        }
     }
 }
 
@@ -326,7 +331,8 @@ static pid_t start_child(char *const child_argv[]) {
     }
 
     close(start_pipe[0]);
-    if (ptrace(PTRACE_SEIZE, child, 0, PTRACE_O_TRACECLONE | PTRACE_O_EXITKILL) == -1) {
+    if (ptrace(PTRACE_SEIZE, child, 0,
+               PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | PTRACE_O_EXITKILL) == -1) {
         fail("failed to seize workload child");
     }
     if (ptrace(PTRACE_INTERRUPT, child, 0, 0) == -1) {
@@ -353,38 +359,48 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    const char *status_path = getenv("PERFLOOP_PROBE_STATUS_FILE");
-    if (status_path == NULL || status_path[0] == '\0') {
-        fprintf(stderr, "workspace_diagnostic_futex_probe: PERFLOOP_PROBE_STATUS_FILE is required\n");
+    const char *socket_path = getenv("PERFLOOP_PROBE_CONTROL_SOCKET");
+    if (socket_path == NULL || socket_path[0] == '\0') {
+        fprintf(stderr, "workspace_diagnostic_futex_probe: PERFLOOP_PROBE_CONTROL_SOCKET is required\n");
         return EXIT_FAILURE;
     }
 
+    const int socket_fd = create_control_socket(socket_path);
     const pid_t child = start_child(&argv[1]);
+    struct control_state control = {0};
     struct statistics statistics = {0};
-    bool saw_active = false;
-    bool saw_complete = false;
 
     while (active_tracees() > 0) {
-        drain_events();
-        const enum marker_state state = marker_state(status_path);
-        if (state == MARKER_ACTIVE) {
-            saw_active = true;
-            sample_waiters(&statistics);
-        } else if (state == MARKER_COMPLETE) {
-            saw_complete = true;
+        drain_control(socket_fd, &control);
+
+        int status = 0;
+        const pid_t tid = waitpid(-1, &status, __WALL);
+        if (tid == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == ECHILD) {
+                break;
+            }
+            fail("failed while tracing workload");
         }
-        usleep(500);
+        process_stop(tid, status, socket_fd, &control, &statistics);
     }
 
     (void)child;
-    if (!saw_active || !saw_complete) {
-        fprintf(stderr, "workspace_diagnostic_futex_probe: workload did not expose an active and complete marker\n");
-        return EXIT_FAILURE;
+    close(socket_fd);
+    if (unlink(socket_path) == -1 && errno != ENOENT) {
+        fail("failed to remove control socket");
+    }
+    if (!control.interval_started || !control.interval_complete) {
+        errno = EPROTO;
+        fail("workload did not complete the measured control interval");
     }
 
-    printf("futex_wait_samples=%llu\n", statistics.wait_samples);
+    printf("futex_wait_calls=%llu\n", statistics.futex_wait_calls);
+    printf("futex_blocked_waits=%llu\n", statistics.futex_blocked_waits);
     printf("futex_wait_addresses=%zu\n", statistics.address_count);
-    printf("futex_wait_max_address_samples=%llu\n", statistics.max_address_samples);
-    printf("futex_wait_max_same_address=%u\n", statistics.max_same_address_waiters);
+    printf("futex_wait_max_address_calls=%llu\n", statistics.max_address_calls);
+    printf("futex_wait_max_address_blocked_waits=%llu\n", statistics.max_address_blocked_waits);
     return EXIT_SUCCESS;
 }

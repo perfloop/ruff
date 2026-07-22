@@ -29,11 +29,10 @@ export TY_MAX_PARALLELISM=4
 
 run_profile() {
     local name=$1
-    local status_file="$work_dir/$name.status"
+    local control_socket="$work_dir/$name.socket"
     local output_file="$work_dir/$name.output"
 
-    : > "$status_file"
-    PERFLOOP_PROBE_STATUS_FILE="$status_file" \
+    PERFLOOP_PROBE_CONTROL_SOCKET="$control_socket" \
         "$probe" "$driver" "--probe-$name" > "$output_file"
 }
 
@@ -53,23 +52,19 @@ read_metric() {
 run_profile rich
 run_profile sparse
 
-rich_wait_samples=$(read_metric "$work_dir/rich.output" futex_wait_samples)
-sparse_wait_samples=$(read_metric "$work_dir/sparse.output" futex_wait_samples)
-rich_max_address_samples=$(read_metric "$work_dir/rich.output" futex_wait_max_address_samples)
-sparse_max_address_samples=$(read_metric "$work_dir/sparse.output" futex_wait_max_address_samples)
-rich_max_same_address=$(read_metric "$work_dir/rich.output" futex_wait_max_same_address)
-sparse_max_same_address=$(read_metric "$work_dir/sparse.output" futex_wait_max_same_address)
+rich_wait_calls=$(read_metric "$work_dir/rich.output" futex_wait_calls)
+sparse_wait_calls=$(read_metric "$work_dir/sparse.output" futex_wait_calls)
+rich_blocked_waits=$(read_metric "$work_dir/rich.output" futex_blocked_waits)
+sparse_blocked_waits=$(read_metric "$work_dir/sparse.output" futex_blocked_waits)
+rich_max_address_blocked_waits=$(read_metric "$work_dir/rich.output" futex_wait_max_address_blocked_waits)
+sparse_max_address_blocked_waits=$(read_metric "$work_dir/sparse.output" futex_wait_max_address_blocked_waits)
+blocked_wait_delta=$((rich_blocked_waits - sparse_blocked_waits))
 
-delta_observed=false
-if (( rich_wait_samples > sparse_wait_samples && rich_max_same_address >= 2 )); then
-    delta_observed=true
-fi
-
-printf 'futex_probe_completed=true rich_futex_wait_samples=%s sparse_futex_wait_samples=%s rich_futex_wait_max_address_samples=%s sparse_futex_wait_max_address_samples=%s rich_futex_wait_max_same_address=%s sparse_futex_wait_max_same_address=%s\n' \
-    "$rich_wait_samples" \
-    "$sparse_wait_samples" \
-    "$rich_max_address_samples" \
-    "$sparse_max_address_samples" \
-    "$rich_max_same_address" \
-    "$sparse_max_same_address"
-printf 'futex_wait_delta_observed=%s\n' "$delta_observed"
+printf 'futex_trace_completed=true rich_futex_wait_calls=%s sparse_futex_wait_calls=%s rich_futex_blocked_waits=%s sparse_futex_blocked_waits=%s rich_futex_wait_max_address_blocked_waits=%s sparse_futex_wait_max_address_blocked_waits=%s rich_minus_sparse_futex_blocked_waits=%s\n' \
+    "$rich_wait_calls" \
+    "$sparse_wait_calls" \
+    "$rich_blocked_waits" \
+    "$sparse_blocked_waits" \
+    "$rich_max_address_blocked_waits" \
+    "$sparse_max_address_blocked_waits" \
+    "$blocked_wait_delta"

@@ -9,6 +9,8 @@
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::num::NonZeroUsize;
+#[cfg(unix)]
+use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -322,15 +324,33 @@ struct Measurement {
 }
 
 fn marker(stage: &str) -> Result<()> {
-    let Some(path) = std::env::var_os("PERFLOOP_PROBE_STATUS_FILE") else {
+    let Some(path) = std::env::var_os("PERFLOOP_PROBE_CONTROL_SOCKET") else {
         return Ok(());
     };
-    fs::write(&path, stage).with_context(|| {
-        format!(
-            "failed to write probe status marker at {}",
-            PathBuf::from(path).display()
-        )
-    })
+    let marker = match stage {
+        "active" => b'A',
+        "complete" => b'C',
+        _ => return Ok(()),
+    };
+    let path = PathBuf::from(path);
+
+    #[cfg(unix)]
+    {
+        let socket = UnixDatagram::unbound().context("failed to create probe control socket")?;
+        socket
+            .send_to(&[marker], &path)
+            .with_context(|| format!("failed to send probe marker to {}", path.display()))?;
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = marker;
+        bail!(
+            "PERFLOOP_PROBE_CONTROL_SOCKET is only supported on Unix: {}",
+            path.display()
+        );
+    }
 }
 
 fn run(workload: Workload) -> Result<Measurement> {
