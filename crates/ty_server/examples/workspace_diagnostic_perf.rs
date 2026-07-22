@@ -172,11 +172,14 @@ impl ServerClient {
             ..InitializeParams::default()
         };
 
-        let initialize_id = self.send_request(InitializeRequest::METHOD, params)?;
+        let initialize_id = self.send_request(InitializeRequest::METHOD.as_str(), params)?;
         let initialize_result = self.await_response(&initialize_id)?;
         let _: lsp_types::InitializeResult = serde_json::from_value(initialize_result)
             .context("server returned an invalid initialize response")?;
-        self.send_notification(InitializedNotification::METHOD, InitializedParams {})?;
+        self.send_notification(
+            InitializedNotification::METHOD.as_str(),
+            InitializedParams {},
+        )?;
         self.wait_until_configured()
     }
 
@@ -191,16 +194,17 @@ impl ServerClient {
             },
             partial_result_params: PartialResultParams::default(),
         };
-        let request_id = self.send_request(WorkspaceDiagnosticRequest::METHOD, params)?;
+        let request_id = self.send_request(WorkspaceDiagnosticRequest::METHOD.as_str(), params)?;
         let response = self.await_response(&request_id)?;
         serde_json::from_value(response)
             .context("server returned an invalid workspace diagnostic response")
     }
 
     fn shutdown(&mut self) -> Result<()> {
-        let request_id = self.send_request(lsp_types::ShutdownRequest::METHOD, Value::Null)?;
+        let request_id =
+            self.send_request(lsp_types::ShutdownRequest::METHOD.as_str(), Value::Null)?;
         let _ = self.await_response(&request_id)?;
-        self.send_notification(lsp_types::ExitNotification::METHOD, Value::Null)
+        self.send_notification(lsp_types::ExitNotification::METHOD.as_str(), Value::Null)
     }
 
     fn send_request(&mut self, method: &str, params: impl serde::Serialize) -> Result<RequestId> {
@@ -231,7 +235,9 @@ impl ServerClient {
     fn wait_until_configured(&mut self) -> Result<()> {
         loop {
             match self.receive()? {
-                Message::Request(request) if request.method == ConfigurationRequest::METHOD => {
+                Message::Request(request)
+                    if request.method == ConfigurationRequest::METHOD.as_str() =>
+                {
                     self.handle_server_request(request)?;
                     return Ok(());
                 }
@@ -281,28 +287,31 @@ impl ServerClient {
     }
 
     fn handle_server_request(&self, request: ServerRequest) -> Result<()> {
-        match request.method.as_str() {
-            ConfigurationRequest::METHOD => {
-                let params: ConfigurationParams = serde_json::from_value(request.params)
-                    .context("server sent invalid workspace/configuration parameters")?;
-                let mut values = Vec::with_capacity(params.items.len());
-                for item in params.items {
-                    if item.section.as_deref() == Some("ty") {
-                        values.push(
-                            serde_json::to_value(&self.options)
-                                .context("failed to serialize workspace configuration")?,
-                        );
-                    } else {
-                        values.push(Value::Null);
-                    }
+        if request.method == ConfigurationRequest::METHOD.as_str() {
+            let params: ConfigurationParams = serde_json::from_value(request.params)
+                .context("server sent invalid workspace/configuration parameters")?;
+            let mut values = Vec::with_capacity(params.items.len());
+            for item in params.items {
+                if item.section.as_deref() == Some("ty") {
+                    values.push(
+                        serde_json::to_value(&self.options)
+                            .context("failed to serialize workspace configuration")?,
+                    );
+                } else {
+                    values.push(Value::Null);
                 }
-                self.send(Message::Response(Response::new_ok(request.id, values)))
             }
-            WorkDoneProgressCreateRequest::METHOD => {
-                self.send(Message::Response(Response::new_ok(request.id, Value::Null)))
-            }
-            method => bail!("server sent an unsupported client request: {method}"),
+            return self.send(Message::Response(Response::new_ok(request.id, values)));
         }
+
+        if request.method == WorkDoneProgressCreateRequest::METHOD.as_str() {
+            return self.send(Message::Response(Response::new_ok(request.id, Value::Null)));
+        }
+
+        bail!(
+            "server sent an unsupported client request: {}",
+            request.method
+        )
     }
 }
 
