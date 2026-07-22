@@ -30,9 +30,11 @@ export TY_MAX_PARALLELISM=4
 run_profile() {
     local name=$1
     local control_socket="$work_dir/$name.socket"
+    local ack_socket="$work_dir/$name.ack"
     local output_file="$work_dir/$name.output"
 
     PERFLOOP_PROBE_CONTROL_SOCKET="$control_socket" \
+        PERFLOOP_PROBE_ACK_SOCKET="$ack_socket" \
         "$probe" "$driver" "--probe-$name" > "$output_file"
 }
 

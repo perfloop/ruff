@@ -1,23 +1,28 @@
 /*
  * Trace completed futex waits in a child workspace-diagnostic workload.
  *
- * The standalone driver sends two datagrams over a control socket: one directly
- * before it submits workspace/diagnostic and one after it receives the complete
- * response. Between those ordered protocol events this helper follows every
- * futex syscall entry and exit with PTRACE_SYSCALL. Unlike a polling sample, a
- * counted wait is a syscall the traced process actually completed.
+ * The standalone driver synchronizes the measured interval with this helper by
+ * sending an active/complete datagram and waiting for the corresponding ack.
+ * The child installs a seccomp filter that produces ptrace events only for
+ * futex syscalls. A counted blocked wait is therefore a completed futex wait
+ * from the exact acknowledged request interval, not a polling observation.
  */
 
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <linux/filter.h>
 #include <linux/futex.h>
+#include <linux/seccomp.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -37,7 +42,6 @@
 struct tracee {
     pid_t tid;
     bool active;
-    bool in_syscall;
     bool pending_futex_wait;
     unsigned long long pending_address;
 };
@@ -61,6 +65,7 @@ struct control_state {
     bool interval_active;
     bool interval_started;
     bool interval_complete;
+    const char *ack_path;
 };
 
 static struct tracee tracees[MAX_THREADS];
@@ -115,9 +120,15 @@ static size_t active_tracees(void) {
     return count;
 }
 
-static void resume_tracee(pid_t tid, int signal_to_deliver) {
-    if (ptrace(PTRACE_SYSCALL, tid, 0, signal_to_deliver) == -1 && errno != ESRCH) {
+static void resume_continue(pid_t tid, int signal_to_deliver) {
+    if (ptrace(PTRACE_CONT, tid, 0, signal_to_deliver) == -1 && errno != ESRCH) {
         fail("failed to resume traced thread");
+    }
+}
+
+static void resume_until_syscall_exit(pid_t tid) {
+    if (ptrace(PTRACE_SYSCALL, tid, 0, 0) == -1 && errno != ESRCH) {
+        fail("failed to resume traced futex wait");
     }
 }
 
@@ -159,20 +170,24 @@ static void record_blocked_wait(struct statistics *statistics, unsigned long lon
     }
 }
 
-static int create_control_socket(const char *path) {
-    if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+static void sockaddr_from_path(struct sockaddr_un *address, const char *path) {
+    if (strlen(path) >= sizeof(address->sun_path)) {
         errno = ENAMETOOLONG;
-        fail("control socket path is too long");
+        fail("Unix socket path is too long");
     }
+    *address = (struct sockaddr_un){0};
+    address->sun_family = AF_UNIX;
+    memcpy(address->sun_path, path, strlen(path) + 1);
+}
 
+static int create_control_socket(const char *path) {
     const int socket_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (socket_fd == -1) {
         fail("failed to create control socket");
     }
 
-    struct sockaddr_un address = {0};
-    address.sun_family = AF_UNIX;
-    memcpy(address.sun_path, path, strlen(path) + 1);
+    struct sockaddr_un address;
+    sockaddr_from_path(&address, path);
     if (unlink(path) == -1 && errno != ENOENT) {
         fail("failed to remove stale control socket");
     }
@@ -180,6 +195,21 @@ static int create_control_socket(const char *path) {
         fail("failed to bind control socket");
     }
     return socket_fd;
+}
+
+static void acknowledge_marker(const char *ack_path, unsigned char marker) {
+    const int socket_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (socket_fd == -1) {
+        fail("failed to create acknowledgement socket");
+    }
+
+    struct sockaddr_un address;
+    sockaddr_from_path(&address, ack_path);
+    if (sendto(socket_fd, &marker, 1, 0, (const struct sockaddr *)&address, sizeof(address)) != 1) {
+        close(socket_fd);
+        fail("failed to acknowledge control marker");
+    }
+    close(socket_fd);
 }
 
 static void drain_control(int socket_fd, struct control_state *control) {
@@ -202,6 +232,7 @@ static void drain_control(int socket_fd, struct control_state *control) {
                 }
                 control->interval_started = true;
                 control->interval_active = true;
+                acknowledge_marker(control->ack_path, 'A');
                 break;
             case 'C':
                 if (!control->interval_started || control->interval_complete) {
@@ -210,6 +241,7 @@ static void drain_control(int socket_fd, struct control_state *control) {
                 }
                 control->interval_active = false;
                 control->interval_complete = true;
+                acknowledge_marker(control->ack_path, 'C');
                 break;
             default:
                 errno = EPROTO;
@@ -231,7 +263,7 @@ static bool futex_wait_address(const struct user_regs_struct *registers,
     return is_wait;
 }
 
-static void observe_syscall_stop(struct tracee *tracee, const struct control_state *control,
+static void observe_seccomp_stop(struct tracee *tracee, const struct control_state *control,
                                  struct statistics *statistics) {
     struct user_regs_struct registers;
     if (ptrace(PTRACE_GETREGS, tracee->tid, 0, &registers) == -1) {
@@ -239,28 +271,36 @@ static void observe_syscall_stop(struct tracee *tracee, const struct control_sta
             remove_tracee(tracee->tid);
             return;
         }
-        fail("failed to read traced thread registers");
+        fail("failed to read futex syscall registers");
     }
 
-    if (!tracee->in_syscall) {
-        tracee->in_syscall = true;
-        unsigned long long address = 0;
-        if (control->interval_active && futex_wait_address(&registers, &address)) {
-            tracee->pending_futex_wait = true;
-            tracee->pending_address = address;
-            record_wait_call(statistics, address);
+    unsigned long long address = 0;
+    if (control->interval_active && futex_wait_address(&registers, &address)) {
+        tracee->pending_futex_wait = true;
+        tracee->pending_address = address;
+        record_wait_call(statistics, address);
+        resume_until_syscall_exit(tracee->tid);
+    } else {
+        resume_continue(tracee->tid, 0);
+    }
+}
+
+static void observe_futex_exit(struct tracee *tracee, struct statistics *statistics) {
+    struct user_regs_struct registers;
+    if (ptrace(PTRACE_GETREGS, tracee->tid, 0, &registers) == -1) {
+        if (errno == ESRCH) {
+            remove_tracee(tracee->tid);
+            return;
         }
-        return;
+        fail("failed to read futex return register");
     }
 
-    tracee->in_syscall = false;
-    if (tracee->pending_futex_wait) {
-        /* -EAGAIN means the value changed before the kernel could sleep. */
-        if ((long)registers.rax != -EAGAIN) {
-            record_blocked_wait(statistics, tracee->pending_address);
-        }
-        tracee->pending_futex_wait = false;
+    /* -EAGAIN means the value changed before the kernel could sleep. */
+    if ((long)registers.rax != -EAGAIN) {
+        record_blocked_wait(statistics, tracee->pending_address);
     }
+    tracee->pending_futex_wait = false;
+    resume_continue(tracee->tid, 0);
 }
 
 static void process_stop(pid_t tid, int status, int socket_fd, struct control_state *control,
@@ -287,24 +327,43 @@ static void process_stop(pid_t tid, int status, int socket_fd, struct control_st
             fail("failed to read cloned thread id");
         }
         add_tracee((pid_t)child_tid);
-        tracee->in_syscall = false;
-        resume_tracee(tid, 0);
+        resume_continue(tid, 0);
         return;
     }
 
-    if (signal_number == (SIGTRAP | 0x80)) {
-        observe_syscall_stop(tracee, control, statistics);
-        if (tracee->active) {
-            resume_tracee(tid, 0);
-        }
+    if (signal_number == SIGTRAP && event == PTRACE_EVENT_SECCOMP) {
+        observe_seccomp_stop(tracee, control, statistics);
         return;
     }
 
-    tracee->in_syscall = false;
+    if (signal_number == (SIGTRAP | 0x80) && tracee->pending_futex_wait) {
+        observe_futex_exit(tracee, statistics);
+        return;
+    }
+
     if (signal_number == SIGTRAP || signal_number == SIGSTOP) {
-        resume_tracee(tid, 0);
+        resume_continue(tid, 0);
     } else {
-        resume_tracee(tid, signal_number);
+        resume_continue(tid, signal_number);
+    }
+}
+
+static void install_futex_trace_filter(void) {
+    const struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_futex, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    const struct sock_fprog program = {
+        .len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+        .filter = (struct sock_filter *)filter,
+    };
+
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 ||
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) == -1) {
+        perror("workspace_diagnostic_futex_probe: failed to install seccomp filter");
+        _exit(EXIT_FAILURE);
     }
 }
 
@@ -325,6 +384,7 @@ static pid_t start_child(char *const child_argv[]) {
             _exit(EXIT_FAILURE);
         }
         close(start_pipe[0]);
+        install_futex_trace_filter();
         execvp(child_argv[0], child_argv);
         perror("workspace_diagnostic_futex_probe: failed to exec workload");
         _exit(EXIT_FAILURE);
@@ -332,7 +392,8 @@ static pid_t start_child(char *const child_argv[]) {
 
     close(start_pipe[0]);
     if (ptrace(PTRACE_SEIZE, child, 0,
-               PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | PTRACE_O_EXITKILL) == -1) {
+               PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | PTRACE_O_TRACESECCOMP |
+                   PTRACE_O_EXITKILL) == -1) {
         fail("failed to seize workload child");
     }
     if (ptrace(PTRACE_INTERRUPT, child, 0, 0) == -1) {
@@ -349,7 +410,7 @@ static pid_t start_child(char *const child_argv[]) {
         fail("failed to release workload child");
     }
     close(start_pipe[1]);
-    resume_tracee(child, 0);
+    resume_continue(child, 0);
     return child;
 }
 
@@ -360,31 +421,42 @@ int main(int argc, char *argv[]) {
     }
 
     const char *socket_path = getenv("PERFLOOP_PROBE_CONTROL_SOCKET");
-    if (socket_path == NULL || socket_path[0] == '\0') {
-        fprintf(stderr, "workspace_diagnostic_futex_probe: PERFLOOP_PROBE_CONTROL_SOCKET is required\n");
+    const char *ack_path = getenv("PERFLOOP_PROBE_ACK_SOCKET");
+    if (socket_path == NULL || socket_path[0] == '\0' || ack_path == NULL || ack_path[0] == '\0') {
+        fprintf(stderr, "workspace_diagnostic_futex_probe: control and acknowledgement sockets are required\n");
         return EXIT_FAILURE;
     }
 
     const int socket_fd = create_control_socket(socket_path);
     const pid_t child = start_child(&argv[1]);
-    struct control_state control = {0};
+    struct control_state control = {
+        .ack_path = ack_path,
+    };
     struct statistics statistics = {0};
 
     while (active_tracees() > 0) {
         drain_control(socket_fd, &control);
 
         int status = 0;
-        const pid_t tid = waitpid(-1, &status, __WALL);
-        if (tid == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == ECHILD) {
-                break;
-            }
+        const pid_t tid = waitpid(-1, &status, __WALL | WNOHANG);
+        if (tid > 0) {
+            process_stop(tid, status, socket_fd, &control, &statistics);
+            continue;
+        }
+        if (tid == -1 && errno != ECHILD && errno != EINTR) {
             fail("failed while tracing workload");
         }
-        process_stop(tid, status, socket_fd, &control, &statistics);
+        if (tid == -1 && errno == ECHILD) {
+            break;
+        }
+
+        struct pollfd control_poll = {
+            .fd = socket_fd,
+            .events = POLLIN,
+        };
+        if (poll(&control_poll, 1, 20) == -1 && errno != EINTR) {
+            fail("failed while waiting for a control marker");
+        }
     }
 
     (void)child;

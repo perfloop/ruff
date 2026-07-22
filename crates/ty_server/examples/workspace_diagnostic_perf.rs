@@ -9,6 +9,8 @@
 
 use std::fmt::Write as FmtWrite;
 use std::fs;
+#[cfg(unix)]
+use std::io::ErrorKind;
 use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
@@ -369,32 +371,61 @@ struct Measurement {
 }
 
 fn marker(stage: &str) -> Result<()> {
-    let Some(path) = std::env::var_os("PERFLOOP_PROBE_CONTROL_SOCKET") else {
+    let Some(control_path) = std::env::var_os("PERFLOOP_PROBE_CONTROL_SOCKET") else {
         return Ok(());
     };
+    let ack_path = std::env::var_os("PERFLOOP_PROBE_ACK_SOCKET")
+        .ok_or_else(|| anyhow!("PERFLOOP_PROBE_ACK_SOCKET is required with the control socket"))?;
     let marker = match stage {
         "active" => b'A',
         "complete" => b'C',
         _ => return Ok(()),
     };
-    let path = PathBuf::from(path);
+    let control_path = PathBuf::from(control_path);
+    let ack_path = PathBuf::from(ack_path);
 
     #[cfg(unix)]
     {
-        let socket = UnixDatagram::unbound().context("failed to create probe control socket")?;
+        match fs::remove_file(&ack_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to clear probe ack socket at {}", ack_path.display())
+                });
+            }
+        }
+        let socket = UnixDatagram::bind(&ack_path).with_context(|| {
+            format!("failed to bind probe ack socket at {}", ack_path.display())
+        })?;
         socket
-            .send_to(&[marker], &path)
-            .with_context(|| format!("failed to send probe marker to {}", path.display()))?;
+            .set_read_timeout(Some(PROBE_RESPONSE_TIMEOUT))
+            .context("failed to set the probe acknowledgement timeout")?;
+        socket.send_to(&[marker], &control_path).with_context(|| {
+            format!("failed to send probe marker to {}", control_path.display())
+        })?;
+
+        let mut acknowledgement = [0u8; 1];
+        let received = socket
+            .recv(&mut acknowledgement)
+            .context("timed out waiting for the probe acknowledgement")?;
+        if received != 1 || acknowledgement[0] != marker {
+            bail!("probe acknowledged the wrong control marker");
+        }
+        drop(socket);
+        fs::remove_file(&ack_path).with_context(|| {
+            format!(
+                "failed to remove probe ack socket at {}",
+                ack_path.display()
+            )
+        })?;
         return Ok(());
     }
 
     #[cfg(not(unix))]
     {
-        let _ = marker;
-        bail!(
-            "PERFLOOP_PROBE_CONTROL_SOCKET is only supported on Unix: {}",
-            path.display()
-        );
+        let _ = (marker, control_path, ack_path);
+        bail!("PERFLOOP_PROBE_CONTROL_SOCKET is only supported on Unix");
     }
 }
 
