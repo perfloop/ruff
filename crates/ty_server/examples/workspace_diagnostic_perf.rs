@@ -43,19 +43,52 @@ enum Workload {
 }
 
 impl Workload {
-    fn parse() -> Result<Self> {
-        let argument = std::env::args().nth(1);
-        match argument.as_deref() {
-            Some("--sample") | Some("--probe-rich") => Ok(Self::Rich),
-            Some("--probe-sparse") => Ok(Self::Sparse),
-            _ => bail!("usage: workspace_diagnostic_perf [--sample|--probe-rich|--probe-sparse]"),
-        }
-    }
-
     const fn expected_diagnostics_per_file(self) -> usize {
         match self {
             Self::Rich => DIAGNOSTICS_PER_FILE,
             Self::Sparse => 1,
+        }
+    }
+}
+
+struct RunPlan {
+    workload: Workload,
+    measured_requests: u32,
+    warmup: bool,
+    trace_request: bool,
+}
+
+impl RunPlan {
+    fn parse() -> Result<Self> {
+        let argument = std::env::args().nth(1);
+        match argument.as_deref() {
+            Some("--sample") => Ok(Self {
+                workload: Workload::Rich,
+                measured_requests: MEASURED_REQUESTS,
+                warmup: true,
+                trace_request: false,
+            }),
+            Some("--sparse-sample") => Ok(Self {
+                workload: Workload::Sparse,
+                measured_requests: MEASURED_REQUESTS,
+                warmup: true,
+                trace_request: false,
+            }),
+            Some("--probe-rich") => Ok(Self {
+                workload: Workload::Rich,
+                measured_requests: 1,
+                warmup: false,
+                trace_request: true,
+            }),
+            Some("--probe-sparse") => Ok(Self {
+                workload: Workload::Sparse,
+                measured_requests: 1,
+                warmup: false,
+                trace_request: true,
+            }),
+            _ => bail!(
+                "usage: workspace_diagnostic_perf [--sample|--sparse-sample|--probe-rich|--probe-sparse]"
+            ),
         }
     }
 }
@@ -409,21 +442,27 @@ fn run_once(workload: Workload, run_index: u32, trace_request: bool) -> Result<M
     })
 }
 
-fn run(workload: Workload) -> Result<Measurement> {
-    let _ = run_once(workload, 0, false)?;
+fn run(plan: RunPlan) -> Result<Measurement> {
+    if plan.warmup {
+        let _ = run_once(plan.workload, 0, false)?;
+    }
 
     let mut elapsed = Duration::ZERO;
     let mut reports = 0usize;
     let mut diagnostic_items = 0usize;
-    for run_index in 1..=MEASURED_REQUESTS {
-        let measurement = run_once(workload, run_index, run_index == 1)?;
+    for run_index in 1..=plan.measured_requests {
+        let measurement = run_once(
+            plan.workload,
+            run_index,
+            plan.trace_request && run_index == 1,
+        )?;
         elapsed += measurement.elapsed;
         reports = measurement.reports;
         diagnostic_items = measurement.diagnostic_items;
     }
 
     Ok(Measurement {
-        elapsed: elapsed / MEASURED_REQUESTS,
+        elapsed: elapsed / plan.measured_requests,
         reports,
         diagnostic_items,
     })
@@ -433,7 +472,7 @@ fn main() -> Result<()> {
     ruff_db::set_program_version("workspace-diagnostic-perf".to_string())
         .map_err(|error| anyhow!("failed to set program version: {error}"))?;
 
-    let measurement = run(Workload::parse()?)?;
+    let measurement = run(RunPlan::parse()?)?;
     println!(
         "{}",
         serde_json::json!({
