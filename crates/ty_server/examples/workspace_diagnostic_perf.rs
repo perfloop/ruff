@@ -33,9 +33,15 @@ use ruff_db::system::{OsSystem, SystemPathBuf};
 use serde_json::Value;
 use ty_server::{ClientOptions, DiagnosticMode, Server};
 
-const FILES: usize = 64;
-const DIAGNOSTICS_PER_FILE: usize = 64;
 const MEASURED_REQUESTS: u32 = 4;
+const SAMPLE_SHAPE: WorkloadShape = WorkloadShape {
+    files: 64,
+    diagnostics_per_file: 64,
+};
+const PROBE_SHAPE: WorkloadShape = WorkloadShape {
+    files: 16,
+    diagnostics_per_file: 64,
+};
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -46,16 +52,23 @@ enum Workload {
 }
 
 impl Workload {
-    const fn expected_diagnostics_per_file(self) -> usize {
+    const fn expected_diagnostics_per_file(self, shape: WorkloadShape) -> usize {
         match self {
-            Self::Rich => DIAGNOSTICS_PER_FILE,
+            Self::Rich => shape.diagnostics_per_file,
             Self::Sparse => 1,
         }
     }
 }
 
+#[derive(Clone, Copy)]
+struct WorkloadShape {
+    files: usize,
+    diagnostics_per_file: usize,
+}
+
 struct RunPlan {
     workload: Workload,
+    shape: WorkloadShape,
     measured_requests: u32,
     warmup: bool,
     trace_request: bool,
@@ -67,24 +80,28 @@ impl RunPlan {
         match argument.as_deref() {
             Some("--sample") => Ok(Self {
                 workload: Workload::Rich,
+                shape: SAMPLE_SHAPE,
                 measured_requests: MEASURED_REQUESTS,
                 warmup: true,
                 trace_request: false,
             }),
             Some("--sparse-sample") => Ok(Self {
                 workload: Workload::Sparse,
+                shape: SAMPLE_SHAPE,
                 measured_requests: MEASURED_REQUESTS,
                 warmup: true,
                 trace_request: false,
             }),
             Some("--probe-rich") => Ok(Self {
                 workload: Workload::Rich,
+                shape: PROBE_SHAPE,
                 measured_requests: 1,
                 warmup: false,
                 trace_request: true,
             }),
             Some("--probe-sparse") => Ok(Self {
                 workload: Workload::Sparse,
+                shape: PROBE_SHAPE,
                 measured_requests: 1,
                 warmup: false,
                 trace_request: true,
@@ -101,14 +118,15 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(workload: Workload, run_index: u32) -> Result<Self> {
+    fn new(workload: Workload, shape: WorkloadShape, run_index: u32) -> Result<Self> {
         let root = std::env::current_dir()
             .context("failed to determine the repository root")?
             .join(".perfloop-workspace-diagnostic")
             .join(format!(
-                "{}-{}-{run_index}",
+                "{}-{}-{}-{run_index}",
                 std::process::id(),
-                workload.expected_diagnostics_per_file()
+                shape.files,
+                workload.expected_diagnostics_per_file(shape)
             ));
 
         if root.exists() {
@@ -123,11 +141,11 @@ impl Fixture {
         )
         .context("failed to write the fixture configuration")?;
 
-        for file_index in 0..FILES {
-            let mut source = String::with_capacity(DIAGNOSTICS_PER_FILE * 36);
-            for diagnostic_index in 0..DIAGNOSTICS_PER_FILE {
-                let value = run_index as usize * FILES * DIAGNOSTICS_PER_FILE
-                    + file_index * DIAGNOSTICS_PER_FILE
+        for file_index in 0..shape.files {
+            let mut source = String::with_capacity(shape.diagnostics_per_file * 36);
+            for diagnostic_index in 0..shape.diagnostics_per_file {
+                let value = run_index as usize * shape.files * shape.diagnostics_per_file
+                    + file_index * shape.diagnostics_per_file
                     + diagnostic_index;
                 if matches!(workload, Workload::Rich) || diagnostic_index == 0 {
                     writeln!(source, "value_{value}: str = {value}")?;
@@ -429,8 +447,8 @@ fn marker(stage: &str) -> Result<()> {
     }
 }
 
-fn run_once(workload: Workload, run_index: u32, trace_request: bool) -> Result<Measurement> {
-    let fixture = Fixture::new(workload, run_index)?;
+fn run_once(plan: &RunPlan, run_index: u32, trace_request: bool) -> Result<Measurement> {
+    let fixture = Fixture::new(plan.workload, plan.shape, run_index)?;
     let (mut client, server_thread) = ServerClient::start(&fixture.root)?;
 
     if trace_request {
@@ -459,10 +477,12 @@ fn run_once(workload: Workload, run_index: u32, trace_request: bool) -> Result<M
         }
     }
 
-    let expected_diagnostics = FILES * workload.expected_diagnostics_per_file();
-    if reports != FILES || diagnostic_items < expected_diagnostics {
+    let expected_diagnostics =
+        plan.shape.files * plan.workload.expected_diagnostics_per_file(plan.shape);
+    if reports != plan.shape.files || diagnostic_items < expected_diagnostics {
         bail!(
-            "workspace diagnostic response was incomplete: expected at least {expected_diagnostics} diagnostics across {FILES} reports, got {diagnostic_items} diagnostics across {reports} reports"
+            "workspace diagnostic response was incomplete: expected at least {expected_diagnostics} diagnostics across {} reports, got {diagnostic_items} diagnostics across {reports} reports",
+            plan.shape.files
         );
     }
 
@@ -481,18 +501,14 @@ fn run_once(workload: Workload, run_index: u32, trace_request: bool) -> Result<M
 
 fn run(plan: RunPlan) -> Result<Measurement> {
     if plan.warmup {
-        let _ = run_once(plan.workload, 0, false)?;
+        let _ = run_once(&plan, 0, false)?;
     }
 
     let mut elapsed = Duration::ZERO;
     let mut reports = 0usize;
     let mut diagnostic_items = 0usize;
     for run_index in 1..=plan.measured_requests {
-        let measurement = run_once(
-            plan.workload,
-            run_index,
-            plan.trace_request && run_index == 1,
-        )?;
+        let measurement = run_once(&plan, run_index, plan.trace_request && run_index == 1)?;
         elapsed += measurement.elapsed;
         reports = measurement.reports;
         diagnostic_items = measurement.diagnostic_items;
