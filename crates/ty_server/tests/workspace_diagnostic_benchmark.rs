@@ -1,19 +1,7 @@
-//! Case-local benchmark for diagnostic-rich `workspace/diagnostic` requests.
-//!
-//! The test reuses the repository's in-memory LSP fixture so the timed region
-//! begins at request submission and ends only when the complete response has
-//! been received and validated.
-
-#[path = "e2e/main.rs"]
-mod e2e;
+include!("e2e/main.rs");
 
 use std::fmt::Write as _;
-use std::time::{Duration, Instant};
-
-use lsp_types::WorkspaceDocumentDiagnosticReport;
-use ruff_db::system::SystemPath;
-use ty_server::perfloop_probe;
-use ty_server::{ClientOptions, DiagnosticMode};
+use std::time::Instant;
 
 const FILE_COUNT: usize = 48;
 const ERRORS_PER_FILE: usize = 64;
@@ -37,10 +25,10 @@ fn as_ns(duration: Duration) -> u64 {
 #[test]
 fn workspace_diagnostic_contention_benchmark() -> anyhow::Result<()> {
     let workspace_root = SystemPath::new("src");
-    let mut builder = e2e::TestServerBuilder::new()?
+    let mut builder = TestServerBuilder::new()?
         .with_workspace(workspace_root, None)?
         .with_initialization_options(
-            ClientOptions::default().with_diagnostic_mode(DiagnosticMode::Workspace),
+            ClientOptions::default().with_diagnostic_mode(ty_server::DiagnosticMode::Workspace),
         )
         .with_full_diagnostic_output()
         .enable_diagnostic_related_information(true);
@@ -55,18 +43,20 @@ fn workspace_diagnostic_contention_benchmark() -> anyhow::Result<()> {
 
     let mut server = builder.build().wait_until_workspaces_are_initialized();
 
-    perfloop_probe::reset();
+    ty_server::perfloop_probe::reset();
     let started = Instant::now();
     let report = server.workspace_diagnostic_request(None, None);
     let request_ns = as_ns(started.elapsed());
-    let lock_stats = perfloop_probe::snapshot();
+    let lock_stats = ty_server::perfloop_probe::snapshot();
 
     assert_eq!(report.items.len(), FILE_COUNT);
 
     let mut reported_diagnostics = 0;
     let mut diagnostics_with_rendered_data = 0;
     for item in report.items {
-        let WorkspaceDocumentDiagnosticReport::WorkspaceFullDocumentDiagnosticReport(report) = item
+        let lsp_types::WorkspaceDocumentDiagnosticReport::WorkspaceFullDocumentDiagnosticReport(
+            report,
+        ) = item
         else {
             panic!("a request without prior IDs must return full reports");
         };

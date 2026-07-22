@@ -11,6 +11,56 @@ pub use crate::session::{ClientOptions, DiagnosticMode, GlobalOptions, Workspace
 pub use document::{NotebookDocument, PositionEncoding, TextDocument};
 pub(crate) use session::Session;
 
+/// Temporary lock timing for the case-local workspace-diagnostic benchmark.
+///
+/// This module is compiled only by the benchmark's `perfloop-probe` feature and
+/// is deliberately kept separate from the production code path.
+#[cfg(feature = "perfloop-probe")]
+pub mod perfloop_probe {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct LockStats {
+        pub acquisitions: u64,
+        pub contended_acquisitions: u64,
+        pub total_wait_ns: u64,
+        pub total_hold_ns: u64,
+    }
+
+    static ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
+    static CONTENDED_ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_HOLD_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        ACQUISITIONS.store(0, Ordering::SeqCst);
+        CONTENDED_ACQUISITIONS.store(0, Ordering::SeqCst);
+        TOTAL_WAIT_NS.store(0, Ordering::SeqCst);
+        TOTAL_HOLD_NS.store(0, Ordering::SeqCst);
+    }
+
+    pub fn snapshot() -> LockStats {
+        LockStats {
+            acquisitions: ACQUISITIONS.load(Ordering::SeqCst),
+            contended_acquisitions: CONTENDED_ACQUISITIONS.load(Ordering::SeqCst),
+            total_wait_ns: TOTAL_WAIT_NS.load(Ordering::SeqCst),
+            total_hold_ns: TOTAL_HOLD_NS.load(Ordering::SeqCst),
+        }
+    }
+
+    pub(crate) fn record_lock(wait: Duration, hold: Duration, contended: bool) {
+        let to_ns = |duration: Duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+
+        ACQUISITIONS.fetch_add(1, Ordering::SeqCst);
+        if contended {
+            CONTENDED_ACQUISITIONS.fetch_add(1, Ordering::SeqCst);
+        }
+        TOTAL_WAIT_NS.fetch_add(to_ns(wait), Ordering::SeqCst);
+        TOTAL_HOLD_NS.fetch_add(to_ns(hold), Ordering::SeqCst);
+    }
+}
+
 mod capabilities;
 mod db;
 mod document;
