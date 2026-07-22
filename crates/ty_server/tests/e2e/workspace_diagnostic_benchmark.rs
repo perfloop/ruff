@@ -90,15 +90,8 @@ fn workspace_diagnostic_contention_benchmark() -> anyhow::Result<()> {
         lock_stats.total_hold_ns
     );
     println!(
-        "{{\"metric\":\"workspace_diagnostic_lock_contended_acquires\",\"value\":{}}}",
-        lock_stats.contended_acquisitions
-    );
-    println!(
-        "LOCK_PROFILE acquisitions={} contended={} wait_ns={} hold_ns={}",
-        lock_stats.acquisitions,
-        lock_stats.contended_acquisitions,
-        lock_stats.total_wait_ns,
-        lock_stats.total_hold_ns
+        "LOCK_PROFILE acquisitions={} wait_ns={} hold_ns={}",
+        lock_stats.acquisitions, lock_stats.total_wait_ns, lock_stats.total_hold_ns
     );
 
     Ok(())

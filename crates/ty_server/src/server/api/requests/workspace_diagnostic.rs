@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-#[cfg(feature = "perfloop-probe")]
-use std::sync::TryLockError;
 use std::time::{Duration, Instant};
 
 use lsp_server::RequestId;
@@ -249,21 +247,7 @@ impl ProgressReporter for WorkspaceDiagnosticsProgressReporter<'_> {
         // to unwind with a salsa cancellation next.
         #[cfg(feature = "perfloop-probe")]
         let lock_started = Instant::now();
-        #[cfg(feature = "perfloop-probe")]
-        let mut contended = false;
-        #[cfg(feature = "perfloop-probe")]
-        let mut state = match self.state.try_lock() {
-            Ok(state) => state,
-            Err(TryLockError::WouldBlock) => {
-                contended = true;
-                let Ok(state) = self.state.lock() else {
-                    return;
-                };
-                state
-            }
-            Err(TryLockError::Poisoned(_)) => return,
-        };
-        #[cfg(not(feature = "perfloop-probe"))]
+        // Keep the production acquisition path unchanged; the probe only times it.
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -293,9 +277,10 @@ impl ProgressReporter for WorkspaceDiagnosticsProgressReporter<'_> {
 
         #[cfg(feature = "perfloop-probe")]
         {
+            let wait = lock_acquired.saturating_duration_since(lock_started);
             let hold = lock_acquired.elapsed();
             drop(state);
-            crate::perfloop_probe::record_lock(lock_started.elapsed(), hold, contended);
+            crate::perfloop_probe::record_lock(wait, hold);
         }
     }
 
