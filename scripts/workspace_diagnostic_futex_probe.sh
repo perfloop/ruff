@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Compare externally sampled futex waits for matched sparse and diagnostic-rich
-# workspace/diagnostic requests. The C helper traces the standalone workload;
-# it does not modify or instrument the LSP server source.
+# Observe exact kernel futex-wait entries for matched sparse and diagnostic-rich
+# workspace/diagnostic requests. The C helper traces only between acknowledged
+# driver markers; it does not modify or instrument the LSP server source.
 
 set -euo pipefail
 
@@ -60,7 +60,15 @@ rich_max_address_attempts=$(read_metric "$work_dir/rich.output" futex_wait_max_a
 sparse_max_address_attempts=$(read_metric "$work_dir/sparse.output" futex_wait_max_address_attempts)
 wait_attempt_delta=$((rich_wait_attempts - sparse_wait_attempts))
 
-printf 'futex_trace_completed=true rich_futex_wait_attempts=%s sparse_futex_wait_attempts=%s rich_futex_wait_max_address_attempts=%s sparse_futex_wait_max_address_attempts=%s rich_minus_sparse_futex_wait_attempts=%s\n' \
+# The request bodies and completed responses are validated by the driver. Require
+# the tracer to observe actual wait entries and a corresponding address in both
+# matched runs; a marker-only or pass-through trace is not a successful probe.
+if ((rich_wait_attempts == 0 || sparse_wait_attempts == 0 || rich_max_address_attempts == 0 || sparse_max_address_attempts == 0)); then
+    printf 'futex trace observed no in-interval wait entries for a completed workload\n' >&2
+    exit 1
+fi
+
+printf 'futex_trace_completed=true futex_trace_observation=observed rich_futex_wait_attempts=%s sparse_futex_wait_attempts=%s rich_futex_wait_max_address_attempts=%s sparse_futex_wait_max_address_attempts=%s rich_minus_sparse_futex_wait_attempts=%s\n' \
     "$rich_wait_attempts" \
     "$sparse_wait_attempts" \
     "$rich_max_address_attempts" \

@@ -3,26 +3,23 @@
  *
  * The standalone driver synchronizes the measured interval with this helper by
  * sending an active/complete datagram and waiting for the corresponding ack.
- * The child installs a seccomp filter that produces ptrace events only for
- * futex syscalls. A counted wait attempt is therefore a kernel futex-wait
+ * After the active acknowledgement, the standalone driver installs a seccomp
+ * filter synchronized to its already-created threads. It produces ptrace events
+ * only for futex waits. A counted wait attempt is therefore a kernel futex-wait
  * entry from the exact acknowledged request interval, not a polling observation.
  */
 
 #define _GNU_SOURCE
 
 #include <errno.h>
-#include <linux/filter.h>
 #include <linux/futex.h>
-#include <linux/seccomp.h>
 #include <signal.h>
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <poll.h>
-#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -285,6 +282,10 @@ static void process_stop(pid_t tid, int status, int socket_fd, struct control_st
             fail("failed to read cloned thread id");
         }
         add_tracee((pid_t)child_tid);
+        /* A cloned tracee's PTRACE_EVENT_STOP can be reaped before its parent's
+         * clone event. Resume it here as well as when its stop is later reaped,
+         * so that ordering cannot leave a newly created server worker stopped. */
+        resume_continue((pid_t)child_tid, 0);
         resume_continue(tid, 0);
         return;
     }
@@ -298,33 +299,6 @@ static void process_stop(pid_t tid, int status, int socket_fd, struct control_st
         resume_continue(tid, 0);
     } else {
         resume_continue(tid, signal_number);
-    }
-}
-
-static void install_futex_trace_filter(void) {
-    const struct sock_filter filter[] = {
-        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-        /* Skip the futex-operation filter unless this is SYS_futex. */
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_futex, 0, 8),
-        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[1])),
-        BPF_STMT(BPF_ALU | BPF_AND | BPF_K, FUTEX_CMD_MASK),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FUTEX_WAIT, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FUTEX_WAIT_BITSET, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FUTEX_WAIT_REQUEUE_PI, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-    };
-    const struct sock_fprog program = {
-        .len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
-        .filter = (struct sock_filter *)filter,
-    };
-
-    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 ||
-        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) == -1) {
-        perror("workspace_diagnostic_futex_probe: failed to install seccomp filter");
-        _exit(EXIT_FAILURE);
     }
 }
 
@@ -345,7 +319,6 @@ static pid_t start_child(char *const child_argv[]) {
             _exit(EXIT_FAILURE);
         }
         close(start_pipe[0]);
-        install_futex_trace_filter();
         execvp(child_argv[0], child_argv);
         perror("workspace_diagnostic_futex_probe: failed to exec workload");
         _exit(EXIT_FAILURE);

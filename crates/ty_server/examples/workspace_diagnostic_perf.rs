@@ -7,6 +7,8 @@
 //! complete LSP response is received. Each proof sample warms one instance,
 //! then reports the arithmetic mean of four fresh request/response spans.
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::ffi::{c_int, c_long, c_uint, c_ulong};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 #[cfg(unix)]
@@ -388,6 +390,177 @@ struct Measurement {
     diagnostic_items: usize,
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockFilter {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[repr(C)]
+struct SockFprog {
+    len: u16,
+    filter: *mut SockFilter,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[expect(
+    unsafe_code,
+    reason = "the standalone Linux-only probe calls the kernel seccomp ABI directly"
+)]
+unsafe extern "C" {
+    fn prctl(option: c_int, ...) -> c_int;
+    fn syscall(number: c_long, ...) -> c_long;
+}
+
+/// Enables ptrace stops for future futex waits after the tracer has acknowledged
+/// the active marker. The filter is synchronized to the server and worker threads,
+/// so startup and fixture construction stay outside the traced interval.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[expect(
+    unsafe_code,
+    reason = "the standalone Linux-only probe passes a repr(C) BPF program to the kernel"
+)]
+fn install_futex_trace_filter() -> Result<()> {
+    const PR_SET_NO_NEW_PRIVS: c_int = 38;
+    const SYS_SECCOMP: c_long = 317;
+    const SECCOMP_SET_MODE_FILTER: c_uint = 1;
+    const SECCOMP_FILTER_FLAG_TSYNC: c_ulong = 1;
+    const SECCOMP_RET_TRACE: u32 = 0x7ff0_0000;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    const SYS_FUTEX: u32 = 202;
+    const FUTEX_CMD_MASK: u32 = 0x7f;
+    const FUTEX_WAIT: u32 = 0;
+    const FUTEX_WAIT_BITSET: u32 = 9;
+    const FUTEX_WAIT_REQUEUE_PI: u32 = 11;
+    const BPF_LD: u16 = 0x00;
+    const BPF_W: u16 = 0x00;
+    const BPF_ABS: u16 = 0x20;
+    const BPF_ALU: u16 = 0x04;
+    const BPF_AND: u16 = 0x50;
+    const BPF_JMP: u16 = 0x05;
+    const BPF_JEQ: u16 = 0x10;
+    const BPF_K: u16 = 0x00;
+    const BPF_RET: u16 = 0x06;
+
+    let mut filter = [
+        SockFilter {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        SockFilter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 0,
+            jf: 8,
+            k: SYS_FUTEX,
+        },
+        SockFilter {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: 24,
+        },
+        SockFilter {
+            code: BPF_ALU | BPF_AND | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: FUTEX_CMD_MASK,
+        },
+        SockFilter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 0,
+            jf: 1,
+            k: FUTEX_WAIT,
+        },
+        SockFilter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_TRACE,
+        },
+        SockFilter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 0,
+            jf: 1,
+            k: FUTEX_WAIT_BITSET,
+        },
+        SockFilter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_TRACE,
+        },
+        SockFilter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 0,
+            jf: 1,
+            k: FUTEX_WAIT_REQUEUE_PI,
+        },
+        SockFilter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_TRACE,
+        },
+        SockFilter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = SockFprog {
+        len: filter.len().try_into().expect("futex BPF program fits u16"),
+        filter: filter.as_mut_ptr(),
+    };
+
+    // SAFETY: Both calls use the Linux ABI and only pass pointers to the local,
+    // repr(C) filter program, which remains alive until `syscall` returns.
+    if unsafe {
+        prctl(
+            PR_SET_NO_NEW_PRIVS,
+            1 as c_ulong,
+            0 as c_ulong,
+            0 as c_ulong,
+            0 as c_ulong,
+        )
+    } == -1
+    {
+        bail!(
+            "failed to set no-new-privileges before installing the futex trace filter: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: `program` is a valid Linux `sock_fprog`; TSYNC makes the same
+    // read-only filter apply to the already-created server and worker threads.
+    if unsafe {
+        syscall(
+            SYS_SECCOMP,
+            SECCOMP_SET_MODE_FILTER,
+            SECCOMP_FILTER_FLAG_TSYNC,
+            &program,
+        )
+    } == -1
+    {
+        bail!(
+            "failed to install the synchronized futex trace filter: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn install_futex_trace_filter() -> Result<()> {
+    bail!("the futex trace probe requires x86_64 Linux")
+}
+
 fn marker(stage: &str) -> Result<()> {
     let Some(control_path) = std::env::var_os("PERFLOOP_PROBE_CONTROL_SOCKET") else {
         return Ok(());
@@ -437,6 +610,9 @@ fn marker(stage: &str) -> Result<()> {
                 ack_path.display()
             )
         })?;
+        if stage == "active" {
+            install_futex_trace_filter()?;
+        }
         return Ok(());
     }
 
